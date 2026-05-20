@@ -126,15 +126,24 @@ def pytest_runtest_protocol(
 
     timeout = _parse_timeout(item.config.getini("isolate_timeout"))
 
-    reports = _run_in_spawned_subprocess(item, timeout)
+    # Suspend any pending SIGALRM (armed by pytest-timeout's hookwrapper
+    # prelude) for the entire duration of our hook. The actual test runs
+    # in the spawned child, not in this process, so any SIGALRM that
+    # fires here would crash the xdist worker rather than time-out the
+    # test. The child gets its own ``--timeout`` so Python-level hangs
+    # still produce clean Failed: Timeout reports, and we enforce a
+    # parent-side kill via ``proc.join`` as a backstop. See the docstring
+    # on ``_suspend_sigalrm`` for the gory details.
+    with _suspend_sigalrm():
+        reports = _run_in_spawned_subprocess(item, timeout)
 
-    # Emit reports through the normal pytest channels so xdist + terminal
-    # reporter + junit etc. all see them as if the test ran normally.
-    ihook = item.ihook
-    ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
-    for rep in reports:
-        ihook.pytest_runtest_logreport(report=rep)
-    ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
+        # Emit reports through the normal pytest channels so xdist + terminal
+        # reporter + junit etc. all see them as if the test ran normally.
+        ihook = item.ihook
+        ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
+        for rep in reports:
+            ihook.pytest_runtest_logreport(report=rep)
+        ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
     return True
 
 
@@ -154,47 +163,57 @@ def _parse_timeout(raw: Any) -> float:
 
 @contextmanager
 def _suspend_sigalrm() -> Iterator[None]:
-    """Temporarily disarm any pending SIGALRM in this thread.
+    """Disarm any pending SIGALRM in this thread for the duration of the block.
 
     pytest-timeout (when ``--timeout-method=signal``) installs a SIGALRM
-    handler and arms ``ITIMER_REAL`` for each test. That timer is meant to
-    interrupt the test code, but our isolation hook intercepts
-    ``pytest_runtest_protocol`` before the test runs in this process — so
-    if the SIGALRM fires while we're blocked on ``proc.join``, it lands in
-    our parent process instead of the test, raising ``Failed: Timeout``
-    from inside the hook and crashing the xdist worker.
+    handler and arms ``ITIMER_REAL`` for each test via a hookwrapper that
+    runs around our ``pytest_runtest_protocol``. That timer is meant to
+    interrupt the test code, but our isolation hook intercepts the
+    protocol BEFORE the test runs in this process — the test runs in the
+    spawned child instead. If the SIGALRM fires while we're blocked on
+    ``proc.join`` (or any of the queue-drain / cleanup that follows), it
+    raises ``Failed: Timeout`` from inside the hook and crashes the xdist
+    worker (xdist's worker_internal_error then marks every subsequent
+    test as "found no collectors").
 
-    Suspend the timer + handler for the duration of the wait, then restore
-    them. Best-effort: on platforms without SIGALRM (Windows) this is a
-    no-op. We restore the previous handler on exit so pytest-timeout's
-    own ``cancel_timeout`` still works post-isolation.
+    We disarm the timer and reset the handler to SIG_DFL on entry, and
+    leave them that way on exit. pytest-timeout's own
+    ``pytest_timeout_cancel_timer`` postlude (which runs after our hook
+    returns) sets the same final state — ``setitimer(0)`` + ``SIG_DFL``
+    — so leaving ``SIG_DFL`` in place is what pytest-timeout would have
+    done anyway. Trying to "restore" the prior alarm with the prior
+    remaining time would re-arm it for a value computed before our
+    multi-second join, defeating the whole point of suspending it.
+
+    No-op on platforms without SIGALRM (Windows).
     """
     if not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
         # Windows path — no SIGALRM, no risk of the bug.
         yield
         return
 
-    # Disarm any pending alarm and remember how much time was left so we
-    # can restore it. ``setitimer`` returns the remaining seconds (0.0
-    # means no timer was armed).
-    prev_remaining, prev_interval = signal.setitimer(signal.ITIMER_REAL, 0.0)
-    prev_handler = signal.signal(signal.SIGALRM, signal.SIG_DFL)
-    try:
+    # signal.signal() and signal.setitimer() can only be called from the
+    # main thread (Python raises ValueError otherwise). xdist workers run
+    # the test loop on the main thread of their subprocess, so this is
+    # normally fine — but if anything has spun up a thread that ends up
+    # invoking our hook (unlikely but possible), fall back to a no-op
+    # rather than crashing.
+    import threading
+    if threading.current_thread() is not threading.main_thread():
         yield
-    finally:
-        # Restore the previous handler first so any re-armed timer fires
-        # into the right place, not SIG_DFL (which would terminate us).
-        try:
-            signal.signal(signal.SIGALRM, prev_handler)
-        except Exception:
-            pass
-        if prev_remaining > 0:
-            try:
-                signal.setitimer(
-                    signal.ITIMER_REAL, prev_remaining, prev_interval
-                )
-            except Exception:
-                pass
+        return
+
+    # Disarm any pending alarm and reset the handler. Any SIGALRM that's
+    # already pending in the kernel queue will be delivered to SIG_DFL
+    # (terminate process), but pytest-timeout uses ``setitimer`` not
+    # ``alarm`` — so disarming the timer + resetting the handler in this
+    # order means no signal is ever delivered to us.
+    signal.setitimer(signal.ITIMER_REAL, 0.0)
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    yield
+    # Intentionally do not restore: pytest-timeout's wrapper postlude
+    # will run ``pytest_timeout_cancel_timer`` next, which sets the same
+    # final state we're already in.
 
 
 def _run_in_spawned_subprocess(
@@ -230,46 +249,43 @@ def _run_in_spawned_subprocess(
 
     timed_out = False
     collected: List[Any] = []
-    try:
-        # The parent process owns this join. pytest-timeout (when active)
-        # has armed a SIGALRM via setitimer that fires after the per-test
-        # timeout — but in our world, "the test" is running in the child,
-        # not in this parent thread. If we let the SIGALRM fire here, it
-        # raises ``Failed: Timeout`` inside ``proc.join`` and crashes the
-        # xdist worker (the worker can't recover from a hook handler that
-        # raised mid-protocol). We enforce the timeout ourselves via the
-        # ``timeout`` argument to ``proc.join``, so suspend pytest-timeout's
-        # alarm for the duration of the join and restore it after.
-        #
-        # We pad the parent-side timeout by 5s so the child's pytest-timeout
-        # has time to fire first and produce a clean ``Failed: Timeout``
-        # report. If that fails (e.g. the test is hung in a C extension
-        # that ignores SIGALRM), the parent kill kicks in as a backstop.
-        with _suspend_sigalrm():
+    # The entire parent-side wait loop runs under _suspend_sigalrm() because:
+    #   * proc.join blocks for ~timeout seconds — SIGALRM lands here
+    #   * the queue-drain after the join, plus terminate/kill fallbacks,
+    #     can also be slow enough to overlap with the alarm fire
+    #   * pytest-timeout's SIGALRM raises ``Failed: Timeout`` from inside
+    #     whatever stack frame is current when it fires. If that's our hook,
+    #     the xdist worker crashes and xdist marks every subsequent test
+    #     it would have assigned to that worker as "found no collectors".
+    # We enforce the timeout ourselves via the ``timeout`` argument to
+    # ``proc.join``, padded by 5s so the child's own pytest-timeout has a
+    # chance to fire first and emit a clean Failed: Timeout report.
+    with _suspend_sigalrm():
+        try:
             proc.join(timeout + 5.0)
-        if proc.is_alive():
-            timed_out = True
-            proc.terminate()
-            proc.join(5)
-            if proc.is_alive():  # pragma: no cover — terminate refused
-                proc.kill()
-                proc.join()
+            if proc.is_alive():
+                timed_out = True
+                proc.terminate()
+                proc.join(5)
+                if proc.is_alive():  # pragma: no cover — terminate refused
+                    proc.kill()
+                    proc.join()
 
-        # Drain the queue. There may be zero items on timeout/crash.
-        while True:
-            try:
-                kind, payload = result_q.get_nowait()
-            except Exception:  # queue.Empty raises across mp contexts
-                break
-            if kind == "report":
-                collected.append(payload)
-            elif kind == "error":
-                # Child raised before producing reports — synthesize a
-                # failure below.
-                collected.append(("__error__", payload))
-    finally:
-        result_q.close()
-        result_q.join_thread()
+            # Drain the queue. There may be zero items on timeout/crash.
+            while True:
+                try:
+                    kind, payload = result_q.get_nowait()
+                except Exception:  # queue.Empty raises across mp contexts
+                    break
+                if kind == "report":
+                    collected.append(payload)
+                elif kind == "error":
+                    # Child raised before producing reports — synthesize a
+                    # failure below.
+                    collected.append(("__error__", payload))
+        finally:
+            result_q.close()
+            result_q.join_thread()
 
     # Convert serializable reports back to live TestReport instances.
     reports: List[pytest.TestReport] = []
