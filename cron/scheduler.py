@@ -603,8 +603,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
+        catchup_tag = " ⚠️ Catch-up run (missed its window)" if job.get("_is_catchup_run") else ""
         delivery_content = (
-            f"Cronjob Response: {task_name}\n"
+            f"Cronjob Response: {task_name}{catchup_tag}\n"
             f"(job_id: {job_id})\n"
             f"-------------\n\n"
             f"{content}\n\n"

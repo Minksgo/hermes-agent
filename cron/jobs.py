@@ -1030,7 +1030,36 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # the next future occurrence instead of firing a stale run.
             grace = _compute_grace_seconds(schedule)
             if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
+                # ── Catch-up check ──────────────────────────────────────────
+                # If the job has catchup enabled and is still within the
+                # stale window, run it now instead of fast-forwarding.
+                # This lets LLM-driven jobs (daily reports, summaries, etc.)
+                # actually fire after a gateway restart instead of being
+                # silently skipped.
+                catchup_cfg = job.get("catchup", {})
+                if catchup_cfg.get("enabled"):
+                    missed_seconds = (now - next_run_dt).total_seconds()
+                    stale_hours = catchup_cfg.get("stale_hours", 24) * 3600
+                    max_missed = catchup_cfg.get("max_missed", 1)
+                    catchup_count = job.get("_catchup_count", 0)
+
+                    if missed_seconds <= stale_hours and catchup_count < max_missed:
+                        logger.info(
+                            "Job '%s' missed its scheduled time (%s, missed=%.0fs). "
+                            "Catch-up enabled — running now (catchup #%d/%d).",
+                            job.get("name", job["id"]),
+                            next_run,
+                            missed_seconds,
+                            catchup_count + 1,
+                            max_missed,
+                        )
+                        # Tag the job so run_job can mark the output
+                        job["_is_catchup_run"] = True
+                        job["_catchup_count"] = catchup_count + 1
+                        due.append(job)
+                        continue  # Skip fast-forward; advance_next_run handles scheduling
+
+                # ── Normal fast-forward ─────────────────────────────────────
                 # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
                 new_next = compute_next_run(schedule, now.isoformat())
                 if new_next:
